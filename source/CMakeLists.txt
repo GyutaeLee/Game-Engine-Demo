@@ -14,6 +14,9 @@ include_directories(../dependency/glad/include)
 # GLFW
 include_directories(../dependency/glfw/include)
 
+# GLM
+include_directories(../dependency/glm/include)
+
 # Make executable file
 add_executable(GameEngineDemo ${GAME_ENGINE_FILES} ${GLAD_FILES})
 
