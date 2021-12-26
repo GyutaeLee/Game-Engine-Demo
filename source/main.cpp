@@ -1,12 +1,46 @@
 #include <stdio.h>
+#include <unordered_map>
+#include <string>
+
 #include "glad/glad.h"
 #include "GLFW/glfw3.h"
 #include "imgui/imgui.h"
 
+#include "glm/glm.hpp"
+#include "glm/gtc/quaternion.hpp"
+
+#include "assimp/Importer.hpp"
+#include "assimp/scene.h"
+#include "assimp/postprocess.h"
+#include "assimp/DefaultLogger.hpp"
+
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb/stb_image.h"
+#include "utility.h"
+
+#if defined(_WIN32) || defined(_WIN64) || defined(_DEBUG)
+#define _CRTDBG_MAP_ALLOC
+#include <crtdbg.h>
+#include <direct.h>
+#endif
+
 GLFWwindow* g_window = NULL;
+constexpr int INITIAL_WINDOW_WIDTH = 1250;
+constexpr int INITIAL_WINDOW_HEIGHT = 700;
+int g_window_width = INITIAL_WINDOW_WIDTH;
+int g_window_height = INITIAL_WINDOW_HEIGHT;
 double g_time = 0.0;
 
 void do_your_gui_code();
+
+void camera_reset();
+void camera_update();
+
+void process_scene_mesh(const aiScene* scene);
+void process_scene_material(const aiScene* scene, const char* base_folder);
+void model_init();
+void model_terminate();
+void model_draw();
 
 void imgui_init();
 void imgui_terminate();
@@ -25,6 +59,18 @@ void framebuffer_size_callback(GLFWwindow* window, int width, int height);
 
 int main(void)
 {
+#if defined(_WIN32) || defined(_WIN64) || defined(_DEBUG)
+	// https://docs.microsoft.com/en-us/visualstudio/debugger/finding-memory-leaks-using-the-crt-library?view=vs-2019
+	// Memory Leak Check on Windows using Crt memomry allocation
+	_CrtSetReportMode(_CRT_WARN, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_WARN, _CRTDBG_FILE_STDOUT);
+	_CrtSetReportMode(_CRT_ERROR, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ERROR, _CRTDBG_FILE_STDOUT);
+	_CrtSetReportMode(_CRT_ASSERT, _CRTDBG_MODE_FILE);
+	_CrtSetReportFile(_CRT_ASSERT, _CRTDBG_FILE_STDOUT);
+	_CrtSetDbgFlag(_CRTDBG_ALLOC_MEM_DF | _CRTDBG_LEAK_CHECK_DF);
+#endif
+
 	glfw_init();
 	imgui_init();
 
@@ -75,6 +121,217 @@ void do_your_gui_code()
 	}
 	ImGui::End();
 }
+
+struct Camera
+{
+	float move_speed;
+	float mouse_sensitivity;
+
+	glm::vec3 position;
+	glm::quat rotation;
+	glm::vec3 right;
+	glm::vec3 up;
+	glm::vec3 forward;
+
+	// view space matrix
+	glm::mat4 view;
+
+	// clip space matrix using Perspective Projection
+	float fov_degree;
+	float near_plane;
+	float far_plane;
+	glm::mat4 projection;
+}g_camera;
+
+void camera_reset()
+{
+	// 임의로 move speed와 mouse sensitivity를 적당하게 설정
+	g_camera.move_speed = 50.0f;
+	g_camera.mouse_sensitivity = 0.07f;
+
+	// 카메라 위치와 회전값도 마찬가지.
+	g_camera.position = glm::vec3(0.0f, 5.0f, 10.0f);
+	g_camera.rotation = glm::quat(1.0f, 0.0f, 0.0f, 0.0f);
+
+	// rotation (1, 0, 0, 0)이 그대로 정면을 바라보고 있으므로, right/up/forward는 3차원 공간에서의 기저와 같다.
+	g_camera.right = glm::vec3(1.0f, 0.0f, 0.0f);
+	g_camera.up = glm::vec3(0.0f, 1.0f, 0.0f);
+	g_camera.forward = glm::vec3(0.0f, 0.0f, 1.0f);
+
+	// 설정된 rotation과 position에 따라 view matrix를 갱신
+	g_camera.view = glm::mat4_cast(glm::conjugate(g_camera.rotation));
+	g_camera.view[3][0] = -(g_camera.view[0][0] * g_camera.position.x + g_camera.view[1][0] * g_camera.position.y + g_camera.view[2][0] * g_camera.position.z);
+	g_camera.view[3][1] = -(g_camera.view[0][1] * g_camera.position.x + g_camera.view[1][1] * g_camera.position.y + g_camera.view[2][1] * g_camera.position.z);
+	g_camera.view[3][2] = -(g_camera.view[0][2] * g_camera.position.x + g_camera.view[1][2] * g_camera.position.y + g_camera.view[2][2] * g_camera.position.z);
+
+	// perspective projection을 위해 fov와 near/far plane 값을 설정하고, projection matrix를 갱신.
+	g_camera.fov_degree = 60.0f;
+	g_camera.near_plane = 0.1f;
+	g_camera.far_plane = 1000.0f;
+
+	float aspect = (float)g_window_width;
+	if (g_window_height != 0)
+	{
+		// handle with when the window minimized
+		aspect /= g_window_height;
+	}
+
+	g_camera.projection = glm::perspective(glm::radians(g_camera.fov_degree), aspect, g_camera.near_plane, g_camera.far_plane);
+}
+
+void camera_update()
+{
+	// Window와의 Input Data는 glfw로도 가져올 수 있지만,
+	// 우리는 그 데이터를 ImGui에 다 넣어주고 있기 때문에
+	// 그냥 편하게 ImGui를 사용하도록 한다.
+	// 원하면 glfw로도 구현할 수 있다.
+	ImGuiIO& io = ImGui::GetIO();
+
+	bool should_update_view_matrix = false;
+
+	// 현재 마우스 왼쪽이 클릭되어있는지 && 그리고 ImGui UI가 클릭이 안되어 있는지
+	// io.WantCaptureMouse에 대한 정보는 주석 참조할 것.
+	if (io.MouseDown[GLFW_MOUSE_BUTTON_LEFT] && !io.WantCaptureMouse)
+	{
+		should_update_view_matrix = true;
+
+		// mouse움직임의 delta값을 degree라고 가정하고, radian값으로 바꾸고 mouse sensitivitiy값을 곱하여
+		// 원하는 민감도로 움직이게 한다.
+		float x_delta = glm::radians(io.MouseDelta.x) * g_camera.mouse_sensitivity;
+		float y_delta = glm::radians(io.MouseDelta.y) * g_camera.mouse_sensitivity;
+
+		// 사용자가 x축으로 마우스를 움직였다면 y축에 대한 회전을 만들어야 한다.
+		// 이 때 오른쪽으로 움직였다면 오른쪽으로 회전 시켜야 하는데, x_delta가 양수인데, 3차원 회전에서 양수의 값으로 회전시키면
+		// 왼쪽으로 회전하므로 음수값으로 바꾸어준다.
+		glm::quat y_rot = glm::angleAxis(-x_delta, glm::vec3(0.f, 1.f, 0.f));
+
+		// 사용자가 y축으로 마우스를 움직였다면 x축에 대한 회전을 만들어야 한다.
+		glm::quat x_rot = glm::angleAxis(-y_delta, glm::vec3(1.f, 0.0, 0.f));
+
+		/*
+			Rotation Order : Y -> Previous Rotation -> X
+			Previous Rotation is also Y -> X
+			결과적으로 전체 순서는 Y -> Y -> X -> X 이므로, 최종적으로 Y -> X이다.
+
+			그래서 이전 회전에 대해 delta roation을 곱하는게 가능해진다.
+
+			다음의 수식들을 직접 실행해봄으로써 위에서 말하는 것을, 특히 Y -> Y가 그 회전축에 대한 회전을 축적시키는지를 볼 수 있다
+			float ya1 = 31.f;
+			float ya2 = 78.f;
+			glm::quat y1 = glm::angleAxis(glm::radians(ya1), glm::vec3(0.f, 1.f, 0.f));
+			glm::quat y2 = glm::angleAxis(glm::radians(ya2), glm::vec3(0.f, 1.f, 0.f));
+			glm::quat y3 = glm::angleAxis(glm::radians(ya1 + ya2), glm::vec3(0.f, 1.f, 0.f));
+			glm::quat ycomb = y1 * y2;
+			glm::quat ycomb_reverse = y2 * y1;
+
+			float xa1 = 3.f;
+			float xa2 = 142.f;
+			glm::quat x1 = glm::angleAxis(glm::radians(xa1), glm::vec3(1.f, 0.f, 0.f));
+			glm::quat x2 = glm::angleAxis(glm::radians(xa2), glm::vec3(1.f, 0.f, 0.f));
+			glm::quat x3 = glm::angleAxis(glm::radians(xa1 + xa2), glm::vec3(1.f, 0.f, 0.f));
+			glm::quat xcomb = x1 * x2;
+			glm::quat xcomb_reverse = x2 * x1;
+
+			glm::quat new_y_rot = glm::angleAxis(glm::raidnas(30.f), glm::vec3(0.f, 1.f, 0.f));
+			glm::quat new_x_rot = glm::angleAxis(glm::raidnas(16.f), glm::vec3(1.f, 0.f, 0.f));
+			glm::quat r1 = ((new_y_rot * (y1 * x1)) * new_x_rot);
+			glm::quat r2 = ((y1 * (new_y_rot * x1)) * new_x_rot);
+		*/
+
+		// mouse 움직임 delta 값에 따라 카메라의 새로운 회전 갱신
+		g_camera.rotation = (y_rot * g_camera.rotation) * x_rot;
+
+		// 회전이 갱신되었으므로, quat을 matrix형태로 바꾸어 해당 좌표계의 기저들을 right/up/forward에 잘 넣어준다.
+		glm::mat3 rot_mat = glm::mat3_cast(g_camera.rotation);
+		g_camera.right = rot_mat[0];
+		g_camera.up = rot_mat[1];
+		g_camera.forward = rot_mat[2];
+	}
+
+	// 사용자가 ImGUi에 키보드 상호작용을 하고 있지 않을 때, 자세한 것은 주석 참조.
+	if (!io.WantCaptureKeyboard)
+	{
+		// 이번 프레임의 delta time에 대해 move speed를 곱해 원하는 속도로 움직여주게 해준다.
+		// delta time은 어떤 프레임에서든지 일정한 속도를 내게 해줄 것이다.
+		float delta_move = io.DeltaTime * g_camera.move_speed;
+
+		// 사용자가 shift키를 눌렀다면 10를 곱해 움직임 속도를 가속시켜준다.
+		if (io.KeyShift)
+		{
+			delta_move *= 10.f;
+		}
+
+		// 사용자가 누른 키보드에 따라 일반적인 FPS 카메라의 움직임을 만들어준다.
+		if (io.KeysDown[GLFW_KEY_W])
+		{
+			should_update_view_matrix = true;
+			g_camera.position -= g_camera.forward * delta_move;
+		}
+
+		if (io.KeysDown[GLFW_KEY_A])
+		{
+			should_update_view_matrix = true;
+			g_camera.position -= g_camera.right * delta_move;
+		}
+
+		if (io.KeysDown[GLFW_KEY_S])
+		{
+			should_update_view_matrix = true;
+			g_camera.position += g_camera.forward * delta_move;
+		}
+
+		if (io.KeysDown[GLFW_KEY_D])
+		{
+			should_update_view_matrix = true;
+			g_camera.position += g_camera.right * delta_move;
+		}
+	}
+
+	// 만약 camera의 position/rotation 둘 중 하나라도 업데이트 되었다면
+	// view matrix를 업데이트 해준다.
+	if (should_update_view_matrix)
+	{
+		// camera가 회전한 것과 역방향으로 모든 다른 사물들을 움직여야 하기 때문에
+		// quaternion conjugate로 반대방향으로 회전시켜준다.
+		// 그리고 camera position을 그 rotation 좌표계를 통해 view[3] position자리에 넣어준다.
+		g_camera.view = glm::mat4_cast(glm::conjugate(g_camera.rotation));
+		g_camera.view[3][0] = -(g_camera.view[0][0] * g_camera.position.x + g_camera.view[1][0] * g_camera.position.y + g_camera.view[2][0] * g_camera.position.z);
+		g_camera.view[3][1] = -(g_camera.view[0][1] * g_camera.position.x + g_camera.view[1][1] * g_camera.position.y + g_camera.view[2][1] * g_camera.position.z);
+		g_camera.view[3][2] = -(g_camera.view[0][2] * g_camera.position.x + g_camera.view[1][2] * g_camera.position.y + g_camera.view[2][2] * g_camera.position.z);
+	}
+
+	float aspect = (float)g_window_width;
+	if (g_window_height != 0)
+	{
+		// handle with when the window minimized
+		aspect /= g_window_height;
+	}
+
+	// perspective를 갱신해준다. 이것은 관련 값이 바뀔 때만 업데이트 해줘도 되는데
+	// window dimension 갱신되는 것을 변수를 두고 확인하기가 귀찮아서 그냥 이렇게 매 프레임마다 갱신하게 둔다.
+	g_camera.projection = glm::perspective(glm::radians(g_camera.fov_degree), aspect, g_camera.near_plane, g_camera.far_plane);
+}
+
+void process_scene_mesh(const aiScene* scene);
+void process_scene_material(const aiScene* scene, const char* base_folder);
+
+void model_init()
+{
+#if defined(_WIN32) || defined(_WIN64)
+	// model불러오기전에 현재 이 exe가 어디 경로를 기반으로 상대경로를 불러올 수 있는지
+	// 확인하기 위해 체크
+	char* cwd = _getcwd(NULL, 0);
+	printf("Current Dir : %s\n", cwd);
+	free(cwd);
+#endif
+	// default white texture 생성
+	unsigned char white[4] = { 255,255,255,255 };
+	//glGenTextures(1, &g_default_texture_white));
+
+}
+
+void model_terminate();
+void model_draw();
 
 struct ImguiGLBackEnd
 {
@@ -466,8 +723,6 @@ void glfw_init()
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
 	glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 3);
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
-	constexpr int INITIAL_WINDOW_WIDTH = 1250;
-	constexpr int INITIAL_WINDOW_HEIGHT = 700;
 
 	// glfw를 사용해 해당 OS에 맞는 window 창을 형성하고, 그에 관련된 egl context를 형성함.
 	g_window = glfwCreateWindow(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT, "Second Week", NULL, NULL);
