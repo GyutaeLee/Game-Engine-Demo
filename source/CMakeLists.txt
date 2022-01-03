@@ -13,10 +13,11 @@ set(GAME_ENGINE_FILES main.cpp
 source_group(source FILES ${GAME_ENGINE_FILES})
 
 # GLAD
+set(GLAD_PATH ../dependency/glad)
 set(GLAD_FILES ../dependency/glad/include/glad/glad.h
 				../dependency/glad/src/glad.c)
 source_group(glad FILES ${GLAD_FILES})
-include_directories(../dependency/glad/include)
+include_directories(${GLAD_PATH}/include)
 
 # GLFW
 include_directories(../dependency/glfw/include)
@@ -63,7 +64,7 @@ add_executable(GameEngineDemo
 find_library(GLFW_LIB NAMES glfw3 PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../dependency/glfw/lib)
 target_link_libraries(GameEngineDemo ${GLFW_LIB})
 
-find_library(ASSIMP_LIB NAMES assimp-vc142-mtd PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../../dependency/assimp/lib)
+find_library(ASSIMP_LIB NAMES assimp-vc142-mtd PATHS ${CMAKE_CURRENT_SOURCE_DIR}/../dependency/assimp/lib)
 target_link_libraries(GameEngineDemo ${ASSIMP_LIB})
 
 if(MSVC)
@@ -80,11 +81,11 @@ set(INSTALL_ADDITIONAL_PATH "")
 endif()
 
 # move the dlls into the executable location
-list(APPEND DEPENDENCY_DLLS ../../dependency/assimp/lib/assimp-vc142-mtd.dll)
+list(APPEND DEPENDENCY_DLLS ../dependency/assimp/lib/assimp-vc142-mtd.dll)
 install(FILES ${DEPENDENCY_DLLS} DESTINATION "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${INSTALL_ADDITIONAL_PATH}")
 
 # move resource files into the executable location
-install(DIRECTORY ../../resource DESTINATION "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${INSTALL_ADDITIONAL_PATH}")
+install(DIRECTORY ../resource DESTINATION "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${INSTALL_ADDITIONAL_PATH}")
 
 # move shaders
 install(FILES ${SHADER_FILES} DESTINATION "${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/${INSTALL_ADDITIONAL_PATH}")

@@ -73,6 +73,7 @@ int main(void)
 
 	glfw_init();
 	imgui_init();
+	model_init();
 
 	while (!glfwWindowShouldClose(g_window))
 	{
@@ -88,38 +89,22 @@ int main(void)
 			ImGui::Render();		// ImGui 렌더링 데이터 형성
 		}
 
+		camera_update();
+
 		// ImGui Data 렌더링
 		glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
+		model_draw();
 		imgui_draw();					// ImGUi의 렌더링 데이터를 GPU에 올려서 처리한다.
 
 		glfwSwapBuffers(g_window);
 	}
 
+	model_terminate();
 	imgui_terminate();
 	glfw_terminate();
 
 	return 0;
-}
-
-void do_your_gui_code()
-{
-	ImGui::ShowDemoWindow();
-
-	if (ImGui::Begin("MyWindow"))
-	{
-		static bool show_text = false;
-		if (ImGui::Button("First Button") == true)
-		{
-			show_text = !show_text;
-		}
-
-		if (show_text)
-		{
-			ImGui::Text("You Clicked!");
-		}
-	}
-	ImGui::End();
 }
 
 struct Camera
@@ -312,8 +297,429 @@ void camera_update()
 	g_camera.projection = glm::perspective(glm::radians(g_camera.fov_degree), aspect, g_camera.near_plane, g_camera.far_plane);
 }
 
-void process_scene_mesh(const aiScene* scene);
-void process_scene_material(const aiScene* scene, const char* base_folder);
+struct DirectionalLight
+{
+	glm::vec3 rot_euler;
+	glm::vec3 ambient;
+	glm::vec3 diffuse;
+	glm::vec3 specular;
+};
+
+struct Mesh
+{
+	std::vector<float> position;
+	std::vector<float> normal;
+	std::vector<float> tangent;
+	std::vector<float> uv;
+	std::vector<uint32_t> indices;
+
+	// Model struct에서 std::vector<Material> material의 element index를 가리킨다.
+	// 값이 0 이상이어야 유효하고, 아니라면 g_default_material을 써서 렌더링 해야 한다.
+	int material_index;
+};
+
+// 일반적인 Phong Lighting Model에 따라 렌더링 될 수 있는 Material구조.
+struct Material
+{
+	glm::vec3 ambient;
+	glm::vec3 diffuse;
+	glm::vec3 specular;
+	float shininess;
+
+	bool is_transparent;
+	bool two_sided; //face culling을 양쪽 다 하지 않는지, 혹은 하는지
+
+	// diffuse texture가 없는 Material의 경우 g_default_white_texture 값이 넣어진다.
+	GLuint gl_diffuse;
+
+	// normal mapping을 위해 사용된다.
+	bool has_normal_texture;
+	GLuint gl_normal;
+
+	char debug_mat_name[64];
+};
+
+struct Model
+{
+	// Model data 정보
+	std::vector<Mesh> mesh;
+	std::vector<Material> material;
+
+	// 각 Mesh를 어떤 순서로 렌더링해야 할 지,
+	// 이 vector에 있는 값이 std::vector<Mesh> mesh에 접근하는데 사용된다.
+	std::vector<unsigned> draw_order;
+
+	// Model Rendering에 이용되는 PSO(Pipeline State Object) + Buffers
+	GLuint shader_vertex;
+	GLuint shader_frag;
+	GLuint pso;
+	std::vector<GLuint> vaos;
+	std::vector<GLuint> vbos;
+	std::vector<GLuint> ibos;
+
+	// uniform locations
+	GLint loc_world_mat;
+	GLint loc_view_mat;
+	GLint loc_projection_mat;
+	GLint loc_is_use_tangent;
+	GLint loc_cam_pos;
+	GLint loc_sun_dir;
+	GLint loc_sun_ambient;
+	GLint loc_sun_diffuse;
+	GLint loc_sun_specular;
+	GLint loc_diffuse_texture;
+	GLint loc_normal_texture;
+	GLint loc_mat_ambient;
+	GLint loc_mat_diffuse;
+	GLint loc_mat_specular;
+	GLint loc_mat_shininess;
+
+	// Model의 transform 정보.
+	// rotation의 경우 Unity처럼 각 xyz가 Euler Angle을 나타낸다.
+	glm::vec3 scale;
+	glm::vec3 rot_euler;
+	glm::vec3 position;
+}g_model;
+
+DirectionalLight g_light;
+Material g_default_material;
+GLuint g_default_texture_white;
+
+// Model Transform과 Material의 초기 정보 (Material의 경우 모델 데이터에 적절한 데이터가 없는 경우를 위해)
+constexpr glm::vec3 INITIAL_MODEL_SCALE(1.0f);
+constexpr glm::vec3 INITIAL_MODEL_ROTATION(0.0f);	// xyz가 Euler Angle을 나타낸다.
+constexpr glm::vec3 INITIAL_MODEL_POSITION(0.0f);
+constexpr glm::vec3 INITIAL_MATERIAL_AMBIENT(0.0f);
+constexpr glm::vec3 INITIAL_MATERIAL_DIFFUSE(1.f);
+constexpr glm::vec3 INITIAL_MATERIAL_SPECULAR(1.f);
+constexpr float INITIAL_MATERIAL_SHININESS = 0.f;
+constexpr glm::vec3 INITIAL_LIGHT_ROT_EULER = glm::vec3(65.f, 45.f, 32.f);
+constexpr glm::vec3 INITIAL_LIGHT_AMBIENT = glm::vec3(0.1f);
+constexpr glm::vec3 INITIAL_LIGHT_DIFFUSE = glm::vec3(0.5f);
+constexpr glm::vec3 INITIAL_LIGHT_SPECULAR = glm::vec3(0.2f);
+
+void process_scene_mesh(const aiScene* scene)
+{
+	assert(scene != nullptr &&
+		scene->mMeshes != nullptr &&
+		scene->mNumMeshes != 0);
+
+	g_model.mesh.resize(scene->mNumMeshes);
+
+	for (int mesh_index = 0; mesh_index < scene->mNumMeshes; ++mesh_index)
+	{
+		const aiMesh* ai_mesh = scene->mMeshes[mesh_index];
+
+		// assimp로 모델 파일을 읽어 들일 때, normal/tangent를 생성하라고 했으므로
+		// 필요한 것들이 모두 존재하는지 확인한다.
+		assert(ai_mesh->HasPositions() == true &&
+			ai_mesh->HasNormals() == true &&
+			ai_mesh->HasTangentsAndBitangents() == true &&
+			ai_mesh->HasFaces() == true);
+
+		/*
+		   assimp로부터 mesh data가 왔으므로, 그것을 우리가 원하는 형태에 맞춰서 가공한다.
+		   나는 shader에서 다음과 같이 썼는데,
+		   layout(location = 0) in vec4 a_pos;
+		   layout(location = 1) in vec3 a_normal;
+		   layout(location = 2) in vec3 a_tangent;
+		   layout(location = 3) in vec2 a_uv;
+
+		   Buffer를 개별적으로 두어서
+		   pos x y z w / x y z w / ...
+		   norrmal x y z / x y z / ...
+		   tangent x y z / x y z / ...
+		   uv x y / x y / ...
+		   로 두어서 렌더링할 예정이다.
+
+		   사실 여기에서 바로 GL Buffer들을 만들어도 되지만, 로직을 명확히 하기 위해 assimp처리 단과
+		   GL 처리단을 나누었다.
+	   */
+		
+		Mesh* my_mesh = &(g_model.mesh[mesh_index]);
+
+		// mesh가 가지고 있는 정점 개수에 맞춰 각 CPU Buffer들을 미리 할당.
+		my_mesh->position.resize(ai_mesh->mNumVertices * 4);
+		my_mesh->normal.resize(ai_mesh->mNumVertices * 3);
+		my_mesh->tangent.resize(ai_mesh->mNumVertices * 3);
+		my_mesh->uv.resize(ai_mesh->mNumVertices * 2);
+		for (unsigned ai_vertex_index = 0; ai_vertex_index < ai_mesh->mNumVertices; ++ai_vertex_index)
+		{
+			unsigned access_index = ai_vertex_index * 4;
+			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].x;
+			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].x;
+			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].y;
+			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].z;
+			my_mesh->position[access_index] = 1.f;
+
+			access_index = ai_vertex_index * 3;
+			my_mesh->normal[access_index++] = ai_mesh->mNormals[ai_vertex_index].x;
+			my_mesh->normal[access_index++] = ai_mesh->mNormals[ai_vertex_index].y;
+			my_mesh->normal[access_index] = ai_mesh->mNormals[ai_vertex_index].z;
+
+			access_index = ai_vertex_index * 3;
+			my_mesh->tangent[access_index++] = ai_mesh->mTangents[ai_vertex_index].x;
+			my_mesh->tangent[access_index++] = ai_mesh->mTangents[ai_vertex_index].y;
+			my_mesh->tangent[access_index] = ai_mesh->mTangents[ai_vertex_index].z;
+
+			// UV는 해당 포인터가 존재하는지를 확인하고, 0번째 좌표만을 사용하도록 한다.
+			// 텍스쳐 좌표가 여러개인 경우 쉐이더가 더 복잡해지므로 포인터가 없으면 0으로 넣어준다.
+			access_index = ai_vertex_index * 2;
+
+			if (ai_mesh->mTextureCoords[0])
+			{
+				my_mesh->uv[access_index++] = ai_mesh->mTextureCoords[0][ai_vertex_index].x;
+				my_mesh->uv[access_index] = ai_mesh->mTextureCoords[0][ai_vertex_index].y;
+			}
+			else
+			{
+				my_mesh->uv[access_index++] = 0.f;
+				my_mesh->uv[access_index] = 0.f;
+			}
+		}
+
+		// face는 한 면을 이루는 삼각형의 인덱스를 말한다.
+		for (unsigned ai_face_index = 0; ai_face_index < ai_mesh->mNumFaces; ++ai_face_index)
+		{
+			aiFace face = ai_mesh->mFaces[ai_face_index];
+			size_t indices_size = my_mesh->indices.size();
+			my_mesh->indices.resize(indices_size + face.mNumIndices);
+			memcpy(my_mesh->indices.data() + indices_size, face.mIndices, sizeof(unsigned) * face.mNumIndices);
+		}
+
+		// assimp의 mesh가 가리키는 material index가 있다면
+		// 그것을 mesh struct의 material_index에 넣어준다.
+		// 없다면 음수 값을 넣어준다.
+		if (ai_mesh->mMaterialIndex >= 0)
+		{
+			my_mesh->material_index = ai_mesh->mMaterialIndex;
+		}
+		else
+		{
+			my_mesh->material_index = -1;
+		}
+	}
+}
+
+void process_scene_material(const aiScene* scene, const char* base_folder)
+{
+	// 이미지를 불러올 때 경로에 대한 string 관련 처리를 하기 위해 base_folder의 길이를 계산한다.
+	size_t base_folder_len = strlen(base_folder);
+
+	// 여러 Material이 동일한 이미지를 이용할 수 있기 때문에
+	// 같은 이미지를 여러 번 부르기 보다, 한 번 업로드 하면 그 이미지를 바로 사용할 수 있도록
+	// Key가 string이고, Value가 ImageInfo인 map을 이용한다.
+	struct ImageInfo
+	{
+		int width, height, comp;
+		GLuint gl_id;
+	};
+	std::unordered_map<std::string, ImageInfo> path_texture_map;
+
+	// assimp로부터 texture path를 가져올 때 이용하는 string
+	aiString assimp_str;
+
+	// stbi를 이용할 path를 만들 때 이용하는 string
+	std::string std_str;
+
+	// Material 개수만큼 미리 메모리 할당
+	g_model.material.resize(scene->mNumMaterials);
+	for (unsigned i = 0; i < scene->mNumMaterials; ++i)
+	{
+		Material* model_mat = &(g_model.material[i]);
+
+		// Material 초기화
+		memset(model_mat, 0, sizeof(Material));
+
+		model_mat->ambient = INITIAL_MATERIAL_AMBIENT;
+		model_mat->diffuse = INITIAL_MATERIAL_DIFFUSE;
+		model_mat->specular = INITIAL_MATERIAL_SPECULAR;
+		model_mat->shininess = INITIAL_MATERIAL_SHININESS;
+
+		model_mat->gl_diffuse = g_default_texture_white;
+
+		aiMaterial* assimp_mat = scene->mMaterials[i];
+
+		aiString mat_name = assimp_mat->GetName();
+		size_t name_buffer_size = sizeof(model_mat->debug_mat_name) - 1;
+		size_t copy_size = name_buffer_size < mat_name.length ? name_buffer_size : mat_name.length;
+		memcpy(model_mat->debug_mat_name, mat_name.C_Str(), copy_size);
+		model_mat->debug_mat_name[copy_size] = '\0';
+
+		clock_t start, end;
+		start = clock();
+		// Diffuse Texture가 존재하는지?
+		if (unsigned texture_count = assimp_mat->GetTextureCount(aiTextureType_DIFFUSE))
+		{
+			// 존재한다면 assimp_str에 해당 texture의 경로를 가져온다.
+			assimp_mat->GetTexture(aiTextureType_DIFFUSE, 0, &assimp_str);
+
+			// assimp_str에는 base_folder가 제외된 채로 들어오기 때문에,
+			// 이전 폴더 경로를 추가해 최종 경로를 완성해준다.
+			std_str.reserve(base_folder_len + 1 + assimp_str.length);
+			std_str.assign(base_folder);
+			std_str.append("/");
+			std_str.append(assimp_str.C_Str());
+
+			// 해당 경로의 이미지를 이미 불러왔는지 확인한다.
+			auto ret = path_texture_map.find(std_str);
+
+			ImageInfo info;
+			if (ret == path_texture_map.end())
+			{
+				// 이 이미지를 처음 불러오는 것이므로 stbi를 통해 file에서 memory로 이미지를 올리고, GPU에 올린다.
+				clock_t intense_start, intense_end;
+				intense_start = clock();
+
+				// image를 memory에 올리기
+				unsigned char* data = stbi_load(std_str.c_str(), &info.width, &info.height, &info.comp, 0);
+				intense_end = clock();
+				printf("stbi load %f\n", (float)(intense_end - intense_start) / CLOCKS_PER_SEC);
+
+				intense_start = clock();
+
+				// 해당 cpu memory를 gpu memory로 올리기
+				info.gl_id = gl_load_model_texture(data, info.width, info.height, info.comp);
+				intense_end = clock();
+				printf("GPU upload %f\n", (float)(intense_end - intense_start) / CLOCKS_PER_SEC);
+
+				// map에 key/value 추가
+				path_texture_map[std_str] = info;
+				intense_start = clock();
+				
+				// gpu에 올렸으므로 cpu에서 메모리 해제
+				stbi_image_free(data);
+				intense_end = clock();
+				printf("stbi image free %f\n", (float)(intense_end - intense_start) / CLOCKS_PER_SEC);
+			}
+			else
+			{
+				// 해당 경로의 이미지를 이전에 불렀으므로 그 결과만 가져온다
+				info = ret->second;
+			}
+
+			// gpu에 올라간 diffuse의 texture id를 넣어준다.
+			model_mat->gl_diffuse = info.gl_id;
+
+			// image의 component가 alpha channel이 존재하면
+			// transparency를 통해 blending을 사용하려 할 수 있기 때문에 해당 material의 flag에 set한다.
+			if (info.comp >= 4)
+			{
+				model_mat->is_transparent = true;
+			}
+		}
+
+		if (unsigned texture_count = assimp_mat->GetTextureCount(aiTextureType_NORMALS))
+		{
+			assimp_mat->GetTexture(aiTextureType_NORMALS, 0, &assimp_str);
+
+			std_str.reserve(base_folder_len + 1 + assimp_str.length);
+			std_str.assign(base_folder);
+			std_str.append("/");
+			std_str.append(assimp_str.C_Str());
+
+			auto ret = path_texture_map.find(std_str);
+
+			ImageInfo info;
+			if (ret == path_texture_map.end())
+			{
+				clock_t intense_start, intense_end;
+
+				intense_start = clock();
+				unsigned char* data = stbi_load(std_str.c_str(), &info.width, &info.height, &info.comp, 0);
+				intense_end = clock();
+
+				printf("stbi load %f\n", (float)(intense_end - intense_start) / CLOCKS_PER_SEC);
+
+				intense_start = clock();
+				info.gl_id = gl_load_model_texture(data, info.width, info.height, info.comp);
+				intense_end = clock();
+				printf("GPU upload %f\n", (float)(intense_end - intense_start) / CLOCKS_PER_SEC);
+
+				path_texture_map[std_str] = info;
+
+				intense_start = clock();
+				stbi_image_free(data);
+				intense_end = clock();
+				printf("stbi image free %f\n", (float)(intense_end - intense_start) / CLOCKS_PER_SEC);
+			}
+			else
+			{
+				info = ret->second;
+			}
+
+			model_mat->has_normal_texture = true;
+			model_mat->gl_normal = info.gl_id;
+
+			if (info.comp >= 4)
+			{
+				model_mat->is_transparent = true;
+			}
+		}
+		end = clock();
+		printf("Mat %u : Texture Processing Time %f\n", i, (float)(end - start) / CLOCKS_PER_SEC);
+
+		// lighting map 외의 material color value와 lighting parameter들을 조회한다.
+		constexpr float alpha_threshold = 0.0001f;
+		aiColor4D diffuse;
+		if (AI_SUCCESS == aiGetMaterialColor(assimp_mat, AI_MATKEY_COLOR_DIFFUSE, &diffuse))
+		{
+			model_mat->diffuse.x = diffuse.r;
+			model_mat->diffuse.y = diffuse.g;
+			model_mat->diffuse.z = diffuse.b;
+
+			if (diffuse.a > alpha_threshold && diffuse.a < 1.0f)
+			{
+				model_mat->is_transparent = true;
+			}
+		}
+
+		aiColor4D specular;
+		if (AI_SUCCESS == aiGetMaterialColor(assimp_mat, AI_MATKEY_COLOR_SPECULAR, &specular))
+		{
+			model_mat->specular.x = specular.r;
+			model_mat->specular.y = specular.g;
+			model_mat->specular.z = specular.b;
+
+			if (specular.a > alpha_threshold && specular.a < 1.f)
+			{
+				model_mat->is_transparent = true;
+			}
+		}
+
+		aiColor4D ambient;
+		if (AI_SUCCESS == aiGetMaterialColor(assimp_mat, AI_MATKEY_COLOR_AMBIENT, &ambient))
+		{
+			model_mat->ambient.x = ambient.r;
+			model_mat->ambient.y = ambient.g;
+			model_mat->ambient.z = ambient.b;
+
+			if (ambient.a > alpha_threshold && ambient.a < 1.f)
+			{
+				model_mat->is_transparent = true;
+			}
+		}
+
+		// phong model lighting의 specular 연산에 이용되는 shininess 값
+		ai_real shininess, strength;
+		unsigned int max;
+		if (AI_SUCCESS == aiGetMaterialFloatArray(assimp_mat, AI_MATKEY_SHININESS, &shininess, &max))
+		{
+			model_mat->shininess = shininess;
+
+			if (AI_SUCCESS == aiGetMaterialFloatArray(assimp_mat, AI_MATKEY_SHININESS_STRENGTH, &strength, &max)) {
+				model_mat->shininess *= strength;
+			}
+		}
+
+		// 어떤 material의 경우 양면이 둘 다 렌더링 되어야 하는 경우도 있으므로 이것도 조회해서 material에 넣어준다.
+		int is_two_sided = 0;
+		if (AI_SUCCESS == aiGetMaterialIntegerArray(assimp_mat, AI_MATKEY_TWOSIDED, &is_two_sided, &max))
+		{
+			model_mat->two_sided = is_two_sided;
+		}
+	}
+}
 
 void model_init()
 {
@@ -330,8 +736,152 @@ void model_init()
 
 }
 
-void model_terminate();
-void model_draw();
+void model_terminate()
+{
+	// 모두 역순으로 해제.
+	glDeleteVertexArrays((GLsizei)g_model.vaos.size(), g_model.vaos.data());
+	glDeleteBuffers((GLsizei)g_model.vbos.size(), g_model.vbos.data());
+	glDeleteBuffers((GLsizei)g_model.ibos.size(), g_model.ibos.data());
+	glDeleteProgram(g_model.pso);
+	glDeleteShader(g_model.shader_frag);
+	glDeleteShader(g_model.shader_vertex);
+}
+
+// TODO : 코드 다시 작성 필요
+static bool is_sort_draw_order = true;
+void model_draw()
+{
+	assert(g_model.mesh.size() == g_model.vaos.size());
+
+	// viewport 설정
+	glViewport(0, 0, g_window_width, g_window_height);
+
+	// 3d rendering이므로 depth test를 활성화 해준다.
+	glEnable(GL_DEPTH_TEST);
+
+	// model rendering을 위한 pso 사용
+	glUseProgram(g_model.pso);
+
+	constexpr glm::mat4 identity(1.f);
+
+	// model의 local to world 좌표계를 형성해준다.
+
+	// Rotation Order : Y -> X -> Z
+	glm::quat rot = glm::angleAxis(glm::radians(g_model.rot_euler.y), glm::vec3(0.0f, 1.f, 0.f)) *
+		glm::angleAxis(glm::radians(g_model.rot_euler.x), glm::vec3(1.0f, 0.f, 0.f)) *
+		glm::angleAxis(glm::radians(g_model.rot_euler.z), glm::vec3(0.f, 0.f, 1.f));
+	glm::mat4 model_transform = glm::translate(identity, g_model.position) *
+		glm::mat4_cast(rot) *
+		glm::scale(identity, g_model.scale);
+
+	// local to world matrix / world to view matrix / view to clip matrix 업데이트 해주고
+	// lighting을 위해 position을 업데이트 해준다.
+	glUniformMatrix4fv(g_model.loc_world_mat, 1, GL_FALSE, &(model_transform[0][0]));
+	glUniformMatrix4fv(g_model.loc_view_mat, 1, GL_FALSE, &(g_camera.view[0][0]));
+	glUniformMatrix4fv(g_model.loc_projection_mat, 1, GL_FALSE, &(g_camera.projection[0][0]));
+	glUniform3fv(g_model.loc_cam_pos, 1, &(g_camera.position[0]));
+
+	glm::quat light_rot = glm::angleAxis(glm::radians(g_light.rot_euler.y), glm::vec3(0.0f, 1.f, 0.f)) *
+		glm::angleAxis(glm::radians(g_light.rot_euler.x), glm::vec3(1.0f, 0.f, 0.f)) *
+		glm::angleAxis(glm::radians(g_light.rot_euler.z), glm::vec3(0.f, 0.f, 1.f));
+	glm::vec3 light_dir = -(glm::mat3_cast(light_rot)[2]);
+	glUniform3fv(g_model.loc_sun_dir, 1, &(light_dir[0]));
+	glUniform3fv(g_model.loc_sun_ambient, 1, &(g_light.ambient[0]));
+	glUniform3fv(g_model.loc_sun_diffuse, 1, &(g_light.diffuse[0]));
+	glUniform3fv(g_model.loc_sun_specular, 1, &(g_light.specular[0]));
+
+	// diffuse/normal texture에 쓰일 Texture Image Unit을 미리 설정해둔다.
+	glUniform1i(g_model.loc_diffuse_texture, 0);
+	glUniform1i(g_model.loc_normal_texture, 1);
+
+	// 렌더링할 메쉬를 draw_order에 따라서 렌더링 한다.
+
+	// transparent한 mesh rendering의 경우 먼저 opaque한 object를 렌더링 한 후에 해야 한다.
+	// 따라서 draw_order를 통해 material의 transparent 여부로 opaque한 것이 먼저 렌더링 되고
+	// 그 이후에 transparent가 렌더링 되게 한다.
+	g_model.draw_order.resize(g_model.mesh.size());
+	for (unsigned i = 0; i < g_model.mesh.size(); ++i)
+	{
+		g_model.draw_order[i] = i;
+	}
+
+	if (is_sort_draw_order)
+	{
+		std::sort(g_model.draw_order.begin(), g_model.draw_order.end(), [](unsigned a, unsigned b) -> bool
+			{
+				int am_index = g_model.mesh[a].material_index;
+				int bm_index = g_model.mesh[b].material_index;
+				Material* am = am_index >= 0 ? &(g_model.material[am_index]) : &(g_default_material);
+				Material* bm = bm_index >= 0 ? &(g_model.material[bm_index]) : &(g_default_material);
+				return am->is_transparent < bm->is_transparent;
+			});
+	}
+
+	const int mesh_count = (int)g_model.mesh.size();
+	for (int i = 0; i < mesh_count; ++i)
+	{
+		unsigned draw_order = g_model.draw_order[i];
+		const Mesh& mesh = g_model.mesh[draw_order];
+		GLuint vao = g_model.vaos[draw_order];
+
+		// 렌더링할 mesh의 material를 가져온다. 없으면 default material.
+		const Material* mat = &(g_model.material[mesh.material_index]);
+		if (mesh.material_index >= 0)
+		{
+			mat = &(g_model.material[mesh.material_index]);
+		}
+		else
+		{
+			mat = &(g_default_material);
+		}
+
+		// 이에 따라 관련 texture, uniform data 그리고 rasterization state를 설정해준다.
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, mat->gl_diffuse);
+		glUniform3fv(g_model.loc_mat_ambient, 1, &(mat->ambient[0]));
+		glUniform3fv(g_model.loc_mat_diffuse, 1, &(mat->diffuse[0]));
+		glUniform3fv(g_model.loc_mat_specular, 1, &(mat->specular[0]));
+		glUniform1f(g_model.loc_mat_shininess, mat->shininess);
+
+		if (mat->two_sided)
+		{
+			glDisable(GL_CULL_FACE);
+		}
+		else
+		{
+			glEnable(GL_CULL_FACE);
+		}
+
+		// transparent material이라면 일반적인 blending equation을 써준다.
+		if (mat->is_transparent)
+		{
+			glEnable(GL_BLEND);
+			glBlendEquation(GL_FUNC_ADD);
+			glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		}
+		else
+		{
+			glDisable(GL_BLEND);
+		}
+
+		// normal texture를 가지고 있다면 normal mapping을 위해
+		// 관련 unifrom data를 업데이트 해준다.
+		if (mat->has_normal_texture)
+		{
+			glUniform1i(g_model.loc_is_use_tangent, true);
+			glActiveTexture(GL_TEXTURE1);
+			glBindTexture(GL_TEXTURE_2D, mat->gl_normal);
+		}
+		else
+		{
+			glUniform1i(g_model.loc_is_use_tangent, false);
+		}
+
+		// 최종적으로 VAO를 바인드 하고, mesh index 개수에 따라 렌더링 한다.
+		glBindVertexArray(vao);
+		glDrawElements(GL_TRIANGLES, (GLsizei)mesh.indices.size(), GL_UNSIGNED_INT, 0);
+	}
+}
 
 struct ImguiGLBackEnd
 {
@@ -748,4 +1298,116 @@ void glfw_terminate()
 void framebuffer_size_callback(GLFWwindow* window, int width, int height)
 {
 	glViewport(0, 0, width, height);
+}
+
+void do_your_gui_code()
+{
+	// ImGui::ShowDemoWindow();
+	if (ImGui::Begin("Information", 0, ImGuiWindowFlags_HorizontalScrollbar))
+	{
+		// User Interaction를 위한 보조 GUI 보여주기.
+
+		ImGuiIO& io = ImGui::GetIO();
+		ImGui::Text("Application average %.3f ms/frame (%.1f FPS)", 1000.0f / ImGui::GetIO().Framerate, ImGui::GetIO().Framerate);
+
+		ImGui::Separator();
+
+		ImGui::Text("Mouse Delta %f %f", io.MouseDelta.x, io.MouseDelta.y);
+		ImGui::Text("Camera Position : %f %f %f", g_camera.position.x, g_camera.position.y, g_camera.position.z);
+		ImGui::Text("Camera Right : %f %f %f", g_camera.right.x, g_camera.right.y, g_camera.right.z);
+		ImGui::Text("Camera Up : %f %f %f", g_camera.up.x, g_camera.up.y, g_camera.up.z);
+		ImGui::Text("Camera Forward : %f %f %f", g_camera.forward.x, g_camera.forward.y, g_camera.forward.z);
+		ImGui::Text("Camera Mouse Sensitivity"); ImGui::SameLine();
+		ImGui::DragFloat("##CameraMouseSensitivity", &(g_camera.mouse_sensitivity), 0.0001f, 0.01f, 0.1f, "%.4f");
+		ImGui::Text("Camera Move Speed"); ImGui::SameLine();
+		ImGui::DragFloat("##CameraMoveSpeed", &(g_camera.move_speed), 0.01f, 1.f, 100.f, "%.2f");
+		if (ImGui::Button("Camera Reset"))
+		{
+			camera_reset();
+		}
+
+		ImGui::Separator();
+
+		ImGui::Text("Model Position"); ImGui::SameLine();
+		ImGui::DragFloat3("##ModelPosition", &g_model.position.x, 0.01f, FLT_MAX, -FLT_MAX, "%.2f");
+		ImGui::Text("Model Rotation"); ImGui::SameLine();
+		ImGui::DragFloat3("##ModelRotation", &g_model.rot_euler.x, 0.1f, FLT_MAX, -FLT_MAX, "%.1f");
+		ImGui::Text("Model Scale"); ImGui::SameLine();
+		ImGui::DragFloat3("##ModelScale", &g_model.scale.x, 0.001f, FLT_MAX, -FLT_MAX, "%.3f");
+		if (ImGui::Button("Model Reset"))
+		{
+			g_model.scale = INITIAL_MODEL_SCALE;
+			g_model.position = INITIAL_MODEL_POSITION;
+			g_model.rot_euler = INITIAL_MODEL_ROTATION;
+		}
+
+		ImGui::Separator();
+
+		ImGui::Text("Light Rotataion"); ImGui::SameLine();
+		ImGui::DragFloat3("##LightRotataion", &g_light.rot_euler.x, 0.01f, FLT_MAX, -FLT_MAX, "%.2f");
+		ImGui::Text("Light Ambient"); ImGui::SameLine();
+		ImGui::ColorEdit3("##LightAmbient", &g_light.ambient.x);
+		ImGui::Text("Light Diffuse"); ImGui::SameLine();
+		ImGui::ColorEdit3("##LightDiffuse", &g_light.diffuse.x);
+		ImGui::Text("Light Specular"); ImGui::SameLine();
+		ImGui::ColorEdit3("##LightSpecular", &g_light.specular.x);
+		if (ImGui::Button("Light Reset"))
+		{
+			g_light.rot_euler = INITIAL_LIGHT_ROT_EULER;
+			g_light.ambient = INITIAL_LIGHT_AMBIENT;
+			g_light.diffuse = INITIAL_LIGHT_DIFFUSE;
+			g_light.specular = INITIAL_LIGHT_SPECULAR;
+		}
+
+		ImGui::Separator();
+
+		ImGui::Text("Sort Draw Order"); ImGui::SameLine();
+		ImGui::Checkbox("##SortDrawOrder", &is_sort_draw_order);
+
+		ImGui::Separator();
+
+		if (ImGui::TreeNode("Materials"))
+		{
+			for (int i = 0; i < g_model.material.size(); ++i)
+			{
+				Material& mat = g_model.material[i];
+
+				ImGui::PushID(i);
+				{
+					if (ImGui::TreeNode(mat.debug_mat_name))
+					{
+						ImGui::Indent();
+						{
+							ImGui::Text("Material Ambient"); ImGui::SameLine();
+							ImGui::ColorEdit3("##MaterialAmbient", &mat.ambient.x);
+
+							ImGui::Text("Material Diffuse"); ImGui::SameLine();
+							ImGui::ColorEdit3("##MaterialDiffuse", &mat.diffuse.x);
+
+							ImGui::Text("Material Specular"); ImGui::SameLine();
+							ImGui::ColorEdit3("##MaterialSpecular", &mat.specular.x);
+
+							ImGui::Text("Material Shininess"); ImGui::SameLine();
+							ImGui::DragFloat("##MaterialShininess", &(mat.shininess), 0.01f, 0.f, 100.f, "%.2f");
+
+							ImGui::Text("TwoSided"); ImGui::SameLine();
+							ImGui::Checkbox("##MaterialTwoSided", &mat.two_sided);
+
+							ImGui::Text("Has Diffuse Map : %s", mat.gl_diffuse != g_default_texture_white ? "YES" : "NO");
+							ImGui::Text("Has Normal Map : %s", mat.has_normal_texture ? "YES" : "NO");
+							ImGui::Text("IsTransparent : %s", mat.is_transparent ? "YES" : "NO");
+						}
+						ImGui::Unindent();
+
+						ImGui::TreePop();
+					}
+				}
+				ImGui::PopID();
+			}
+			ImGui::TreePop();
+		}
+
+		ImGui::Separator();
+	}
+	ImGui::End();
 }
