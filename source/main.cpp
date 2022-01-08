@@ -75,6 +75,8 @@ int main(void)
 	imgui_init();
 	model_init();
 
+	camera_reset();
+
 	while (!glfwWindowShouldClose(g_window))
 	{
 		glfwPollEvents();
@@ -93,7 +95,8 @@ int main(void)
 
 		// ImGui Data 렌더링
 		glClearColor(0.2f, 0.3f, 0.3f, 1.0f);
-		glClear(GL_COLOR_BUFFER_BIT);
+		glClearDepth(1.0f);
+		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		model_draw();
 		imgui_draw();					// ImGUi의 렌더링 데이터를 GPU에 올려서 처리한다.
 
@@ -1355,13 +1358,15 @@ void imgui_draw()
 
 	// imgui pso를 사용하고, 관련 데이터를 보낸다.
 	glUseProgram(g_imgui_gl.pso_imgui);
+	glActiveTexture(GL_TEXTURE0);
 	glUniform1i(g_imgui_gl.loc_texture, 0);
 	glUniformMatrix4fv(g_imgui_gl.loc_projection, 1, GL_FALSE, &ortho_projection[0][0]);
 
 	// 버퍼 준비
 	glBindVertexArray(g_imgui_gl.vao_ui);
-
-	ImVec2 clip_off = draw_data->DisplayPos;		 // (0,0) unless using multi-viewports
+	glBindBuffer(GL_ARRAY_BUFFER, g_imgui_gl.vbo_ui);
+	glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, g_imgui_gl.ibo_ui);
+	ImVec2 clip_off = draw_data->DisplayPos;         // (0,0) unless using multi-viewports
 	ImVec2 clip_scale = draw_data->FramebufferScale; // (1,1) unless using retina display which are often (2,2)
 
 	// 윈도우 크기가 바뀔 수도 있으므로 항상 viewport를 설정
@@ -1475,6 +1480,8 @@ void glfw_terminate()
 
 void framebuffer_size_callback(GLFWwindow* window, int width, int height)
 {
+	g_window_width = width;
+	g_window_height = height;
 	glViewport(0, 0, width, height);
 }
 
