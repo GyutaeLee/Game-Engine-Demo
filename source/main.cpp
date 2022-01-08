@@ -353,9 +353,9 @@ struct Model
 	GLuint shader_vertex;
 	GLuint shader_frag;
 	GLuint pso;
-	std::vector<GLuint> vaos;
-	std::vector<GLuint> vbos;
-	std::vector<GLuint> ibos;
+	std::vector<GLuint> vaos;	// vertex array object
+	std::vector<GLuint> vbos;	// vertex buffer object
+	std::vector<GLuint> ibos;	// index buffer object
 
 	// uniform locations
 	GLint loc_world_mat;
@@ -446,7 +446,6 @@ void process_scene_mesh(const aiScene* scene)
 		for (unsigned ai_vertex_index = 0; ai_vertex_index < ai_mesh->mNumVertices; ++ai_vertex_index)
 		{
 			unsigned access_index = ai_vertex_index * 4;
-			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].x;
 			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].x;
 			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].y;
 			my_mesh->position[access_index++] = ai_mesh->mVertices[ai_vertex_index].z;
@@ -730,10 +729,188 @@ void model_init()
 	printf("Current Dir : %s\n", cwd);
 	free(cwd);
 #endif
-	// default white texture 생성
-	unsigned char white[4] = { 255,255,255,255 };
-	//glGenTextures(1, &g_default_texture_white));
+	{
+		// default white texture 생성
+		unsigned char white[4] = { 255,255,255,255 };
+		glGenTextures(1, &g_default_texture_white);
+		glBindTexture(GL_TEXTURE_2D, g_default_texture_white);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white);
+		glGenerateMipmap(GL_TEXTURE_2D);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_REPEAT);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
 
+		g_light.rot_euler = INITIAL_LIGHT_ROT_EULER;
+		g_light.ambient = INITIAL_LIGHT_AMBIENT;
+		g_light.diffuse = INITIAL_LIGHT_DIFFUSE;
+		g_light.specular = INITIAL_LIGHT_SPECULAR;
+
+		// default material in case of mesh without material
+		g_default_material.ambient = INITIAL_MATERIAL_AMBIENT;
+		g_default_material.diffuse = INITIAL_MATERIAL_DIFFUSE;
+		g_default_material.specular = INITIAL_MATERIAL_SPECULAR;
+		g_default_material.shininess = INITIAL_MATERIAL_SHININESS;
+		g_default_material.is_transparent = false;
+		g_default_material.two_sided = false;
+		g_default_material.gl_diffuse = g_default_texture_white;
+		g_default_material.has_normal_texture = false;
+
+		g_model.scale = INITIAL_MODEL_SCALE;
+		g_model.position = INITIAL_MODEL_POSITION;
+		g_model.rot_euler = INITIAL_MODEL_ROTATION;
+
+		// Model Data Handling with Assimp
+		{
+			// Assimp::DefaultLogger는 assimp library로 모델을 불러올 때
+			// 무슨 일이 일어나고 있는지를 알 수 있게 해주는 logger system이다.
+			// severity를 verbose / debuggin / normal에 따라 우리가 로그 출력의 정도를 조절할 수 있다.
+			Assimp::Logger::LogSeverity severity = Assimp::Logger::VERBOSE;
+
+			// stdout의 logger를 설정하게 해서 우리의 콘솔창에 뜨게 해준다.
+			Assimp::DefaultLogger::create("", severity, aiDefaultLogStream_STDOUT);
+
+			// 테스트 삼아 singleton의 logger를 가져와서 우리의 로그를 출력시키게 한다.
+			Assimp::DefaultLogger::get()->info("this is my info-call");
+
+			clock_t start, end;
+			start = clock();
+
+			// exe 파일 위치를 기반으로 resource 폴더의 모델 데이터를 불러온다.
+			// 이 때 lighting과 normal mapping을 위해 CalcTangentSpace/GenSmoothNormals/GenUVCoords를 사용해준다.
+			// FlipUVs는 일반적으로 texture uv가 gl에 안 맞춰 있을 수 있는데 그것을 Flip하여 해결이 가능하다.
+			Assimp::Importer importer;
+			const aiScene* scene = importer.ReadFile("resource/rhino/scene.gltf",
+				aiProcess_Triangulate |
+				aiProcess_FlipUVs |
+				aiProcess_CalcTangentSpace |
+				aiProcess_GenSmoothNormals |
+				aiProcess_GenUVCoords);
+			if (!scene || scene->mFlags & AI_SCENE_FLAGS_INCOMPLETE || !scene->mRootNode)
+			{
+				Assimp::DefaultLogger::get()->info(importer.GetErrorString());
+				printf("Fail to Read Model File\n");
+				assert(false);
+			}
+			end = clock();
+
+			printf("Assimp Read Time %f seconds\n", (float)(end - start) / CLOCKS_PER_SEC);
+
+			if (scene->HasMaterials())
+			{
+				start = clock();
+
+				// model file의 material 정보를 조회하여 model data를 처리한다.
+				process_scene_material(scene, "resource/rhino");
+
+				end = clock();
+				printf("Assimp Process Scene Material Time %f seconds\n", (float)(end - start) / CLOCKS_PER_SEC);
+			}
+
+			if (scene->HasMeshes())
+			{
+				start = clock();
+
+				// model file의 mesh를 조회하여 model data를 처리한다.
+				process_scene_mesh(scene);
+
+				end = clock();
+
+				printf("Assimp Process Scene Mesh Time %f seconds\n", (float)(end - start) / CLOCKS_PER_SEC);
+			}
+
+			// 더 이상 부르지 않으므로 logger를 안쓰니까 해제
+			Assimp::DefaultLogger::kill();
+		}
+	}
+
+	{
+		// 모델 렌더리앟는데 사용할 쉐이더를 불러와서 pso까지 생성한다.
+		std::vector<char> shader_source;
+
+		file_open_fill_buffer("model_shader.vert", shader_source);
+		GLuint vso = glCreateShader(GL_VERTEX_SHADER);
+		gl_validate_shader(vso, (const char*)shader_source.data());
+		g_model.shader_vertex = vso;
+
+		file_open_fill_buffer("model_shader.frag", shader_source);
+		GLuint fso = glCreateShader(GL_FRAGMENT_SHADER);
+		gl_validate_shader(fso, (const char*)shader_source.data());
+		g_model.shader_frag = fso;
+
+		GLuint pso = glCreateProgram();
+		gl_validate_program(pso, vso, fso);
+		g_model.pso = pso;
+
+		// 해당 쉐이더에서 uniform들의 위치를 미리 찾아 저장한다.
+		g_model.loc_world_mat = glGetUniformLocation(pso, "world_mat");
+		g_model.loc_view_mat = glGetUniformLocation(pso, "view_mat");
+		g_model.loc_projection_mat = glGetUniformLocation(pso, "projection_mat");
+		g_model.loc_is_use_tangent = glGetUniformLocation(pso, "is_use_tangent");
+		g_model.loc_cam_pos = glGetUniformLocation(pso, "cam_pos");
+		g_model.loc_sun_dir = glGetUniformLocation(pso, "sun_dir");
+		g_model.loc_sun_ambient = glGetUniformLocation(pso, "sun_ambient");
+		g_model.loc_sun_diffuse = glGetUniformLocation(pso, "sun_diffuse");
+		g_model.loc_sun_specular = glGetUniformLocation(pso, "sun_specular");
+		g_model.loc_diffuse_texture = glGetUniformLocation(pso, "diffuse_texture");
+		g_model.loc_normal_texture = glGetUniformLocation(pso, "normal_texture");
+		g_model.loc_mat_ambient = glGetUniformLocation(pso, "mat_ambient");
+		g_model.loc_mat_diffuse = glGetUniformLocation(pso, "mat_diffuse");
+		g_model.loc_mat_specular = glGetUniformLocation(pso, "mat_specular");
+		g_model.loc_mat_shininess = glGetUniformLocation(pso, "mat_shininess");
+
+		// 가공된 Mesh들을 통해 GL Buffers들을 생성한다.
+		constexpr size_t BUFFER_COUNT = 5; // VBO + IBO
+		constexpr size_t VBO_COUNT = 4;
+		const size_t mesh_count = g_model.mesh.size();
+		g_model.vbos.reserve(VBO_COUNT * mesh_count);
+		g_model.ibos.reserve(mesh_count);
+		g_model.vaos.reserve(mesh_count);
+
+		for (const Mesh& mesh : g_model.mesh)
+		{
+			// pos / normal / tangent / uv / indicies
+			GLuint buffers[BUFFER_COUNT] = { 0,0,0,0,0 };
+			glGenBuffers(BUFFER_COUNT, buffers);
+
+			g_model.vbos.push_back(buffers[0]);
+			g_model.vbos.push_back(buffers[1]);
+			g_model.vbos.push_back(buffers[2]);
+			g_model.vbos.push_back(buffers[3]);
+
+			g_model.ibos.push_back(buffers[4]);
+
+			GLuint vao;
+			glGenVertexArrays(1, &vao);
+			g_model.vaos.push_back(vao);
+
+			glBindVertexArray(vao);
+
+			glEnableVertexAttribArray(0);
+			glEnableVertexAttribArray(1);
+			glEnableVertexAttribArray(2);
+			glEnableVertexAttribArray(3);
+
+			glBindBuffer(GL_ARRAY_BUFFER, buffers[0]);
+			glVertexAttribPointer(0, 4, GL_FLOAT, GL_FALSE, sizeof(float) * 4, (void*)0);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(float)* mesh.position.size(), mesh.position.data(), GL_STATIC_DRAW);
+
+			glBindBuffer(GL_ARRAY_BUFFER, buffers[1]);
+			glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 3, (void*)0);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(float)* mesh.normal.size(), mesh.normal.data(), GL_STATIC_DRAW);
+
+			glBindBuffer(GL_ARRAY_BUFFER, buffers[2]);
+			glVertexAttribPointer(2, 3, GL_FLOAT, GL_FALSE, sizeof(float) * 3, (void*)0);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(float)* mesh.tangent.size(), mesh.tangent.data(), GL_STATIC_DRAW);
+
+			glBindBuffer(GL_ARRAY_BUFFER, buffers[3]);
+			glVertexAttribPointer(3, 2, GL_FLOAT, GL_FALSE, sizeof(float) * 2, (void*)0);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(float)* mesh.uv.size(), mesh.uv.data(), GL_STATIC_DRAW);
+
+			glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, buffers[4]);
+			glBufferData(GL_ELEMENT_ARRAY_BUFFER, sizeof(uint32_t)* mesh.indices.size(), mesh.indices.data(), GL_STATIC_DRAW);
+		}
+	}
 }
 
 void model_terminate()
@@ -747,7 +924,6 @@ void model_terminate()
 	glDeleteShader(g_model.shader_vertex);
 }
 
-// TODO : 코드 다시 작성 필요
 static bool is_sort_draw_order = true;
 void model_draw()
 {
@@ -756,25 +932,27 @@ void model_draw()
 	// viewport 설정
 	glViewport(0, 0, g_window_width, g_window_height);
 
-	// 3d rendering이므로 depth test를 활성화 해준다.
+	// 3d rendering이므로 depth test를 활성화해준다.
 	glEnable(GL_DEPTH_TEST);
 
 	// model rendering을 위한 pso 사용
 	glUseProgram(g_model.pso);
 
-	constexpr glm::mat4 identity(1.f);
+	constexpr glm::mat4 identity(1.0f);
 
-	// model의 local to world 좌표계를 형성해준다.
-
+	/* 
+	* model의 local to world 좌표계를 형성해준다.
+	*/ 
+	
 	// Rotation Order : Y -> X -> Z
-	glm::quat rot = glm::angleAxis(glm::radians(g_model.rot_euler.y), glm::vec3(0.0f, 1.f, 0.f)) *
-		glm::angleAxis(glm::radians(g_model.rot_euler.x), glm::vec3(1.0f, 0.f, 0.f)) *
-		glm::angleAxis(glm::radians(g_model.rot_euler.z), glm::vec3(0.f, 0.f, 1.f));
+	glm::quat rot = glm::angleAxis(glm::radians(g_model.rot_euler.y), glm::vec3(0.0f, 1.0f, 0.0f)) *
+		glm::angleAxis(glm::radians(g_model.rot_euler.x), glm::vec3(1.0f, 0.0f, 0.0f)) *
+		glm::angleAxis(glm::radians(g_model.rot_euler.z), glm::vec3(0.0f, 0.0f, 1.0f));
 	glm::mat4 model_transform = glm::translate(identity, g_model.position) *
-		glm::mat4_cast(rot) *
-		glm::scale(identity, g_model.scale);
+								glm::mat4_cast(rot) *
+								glm::scale(identity, g_model.scale);
 
-	// local to world matrix / world to view matrix / view to clip matrix 업데이트 해주고
+	// local to world matrix / world to view matrix / view to clip matrix 업데이트 해주고,
 	// lighting을 위해 position을 업데이트 해준다.
 	glUniformMatrix4fv(g_model.loc_world_mat, 1, GL_FALSE, &(model_transform[0][0]));
 	glUniformMatrix4fv(g_model.loc_view_mat, 1, GL_FALSE, &(g_camera.view[0][0]));
@@ -794,10 +972,10 @@ void model_draw()
 	glUniform1i(g_model.loc_diffuse_texture, 0);
 	glUniform1i(g_model.loc_normal_texture, 1);
 
-	// 렌더링할 메쉬를 draw_order에 따라서 렌더링 한다.
+	// 렌더링할 메쉬를 draw_order에 따라서 렌더링한다.
 
-	// transparent한 mesh rendering의 경우 먼저 opaque한 object를 렌더링 한 후에 해야 한다.
-	// 따라서 draw_order를 통해 material의 transparent 여부로 opaque한 것이 먼저 렌더링 되고
+	// transparent한 mesh rendering의 경우 먼저 opaque한 object를 렌더링 한 후에 해야한다.
+	// 따라서 draw_order를 통해 material의 transparent 여부로 opaque한 것이 먼저 렌더링되고,
 	// 그 이후에 transparent가 렌더링 되게 한다.
 	g_model.draw_order.resize(g_model.mesh.size());
 	for (unsigned i = 0; i < g_model.mesh.size(); ++i)
@@ -824,7 +1002,7 @@ void model_draw()
 		const Mesh& mesh = g_model.mesh[draw_order];
 		GLuint vao = g_model.vaos[draw_order];
 
-		// 렌더링할 mesh의 material를 가져온다. 없으면 default material.
+		// 렌더링할 mehs의 material을 가져온다. 없으면 default material.
 		const Material* mat = &(g_model.material[mesh.material_index]);
 		if (mesh.material_index >= 0)
 		{
@@ -842,7 +1020,7 @@ void model_draw()
 		glUniform3fv(g_model.loc_mat_diffuse, 1, &(mat->diffuse[0]));
 		glUniform3fv(g_model.loc_mat_specular, 1, &(mat->specular[0]));
 		glUniform1f(g_model.loc_mat_shininess, mat->shininess);
-
+		
 		if (mat->two_sided)
 		{
 			glDisable(GL_CULL_FACE);
@@ -877,7 +1055,7 @@ void model_draw()
 			glUniform1i(g_model.loc_is_use_tangent, false);
 		}
 
-		// 최종적으로 VAO를 바인드 하고, mesh index 개수에 따라 렌더링 한다.
+		// 최종적으로 VAO를 바인드하고, mesh index 개수에 따라 렌더링한다.
 		glBindVertexArray(vao);
 		glDrawElements(GL_TRIANGLES, (GLsizei)mesh.indices.size(), GL_UNSIGNED_INT, 0);
 	}
@@ -1275,7 +1453,7 @@ void glfw_init()
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 
 	// glfw를 사용해 해당 OS에 맞는 window 창을 형성하고, 그에 관련된 egl context를 형성함.
-	g_window = glfwCreateWindow(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT, "Second Week", NULL, NULL);
+	g_window = glfwCreateWindow(INITIAL_WINDOW_WIDTH, INITIAL_WINDOW_HEIGHT, "Third Lecture", NULL, NULL);
 	if (g_window == NULL)
 	{
 		printf("Failed to create GLFW Window\n");
