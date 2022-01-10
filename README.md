@@ -18,7 +18,7 @@
 
 **Need To Learn.**
 
-| **4/5** | ![lecture4:5-mode_animation](images/needtolearn/lecture4:5-mode_animation.gif) | Model Animation (CPU/GPU) |
+| **4/5** | ![lecture4-5-mode_animation](images/needtolearn/lecture4-5-mode_animation.gif) | Model Animation (CPU/GPU) |
 | ------- | ------------------------------------------------------------ | ------------------------- |
-| **6/7** | ![lecture6:7-bullet_physics_simulation](images/needtolearn/lecture6:7-bullet_physics_simulation.gif) | Bullet Physics Simulation |
+| **6/7** | ![lecture6-7-bullet_physics_simulation](images/needtolearn/lecture6-7-bullet_physics_simulation.gif) | Bullet Physics Simulation |
 
